@@ -656,7 +656,7 @@ open class TaskWorker(
      * [now] > [nextProgressUpdateTime]
      */
     open fun shouldSendProgressUpdate(currentProgress: Double, now: Long): Boolean {
-        return currentProgress - lastProgressUpdate > 0.02 &&
+        return currentProgress - lastProgressUpdate > 0.0001 &&
                 now > nextProgressUpdateTime
     }
 
