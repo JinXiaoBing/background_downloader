@@ -224,7 +224,7 @@ void main() {
           Platform.isWindows) {
         expect(
             result.exception?.description.endsWith(
-                'Server does not provide content length - cannot chunk download'),
+                'Server does not provide content length - cannot chunk download. If you know the length, set Range or Known-Content-Length header'),
             isTrue);
       }
       expect(result.responseBody, isNull);
@@ -254,13 +254,6 @@ void main() {
         expect(result.exception, isNull);
         expect(result.responseBody ?? '', equals(''));
       }
-    });
-
-    test('retries - must modify transferBytes to fail', () async {
-      FileDownloader().registerCallbacks(taskStatusCallback: statusCallback);
-      expect(await FileDownloader().enqueue(retryTask), isTrue);
-      await statusCallbackCompleter.future;
-      expect(lastStatus, equals(TaskStatus.failed));
     });
 
     test('cancellation', () async {
@@ -304,6 +297,76 @@ void main() {
       final file = File(await task.filePath());
       expect(file.existsSync(), isTrue);
       expect(await file.length(), equals(urlWithLongContentLengthFileSize));
+    });
+  });
+
+  group('Modifications', () {
+    // Tests in this group require modification of the source code
+    // and may fail without that
+    test('[*] retries - must modify transferBytes to fail', () async {
+      // modify the TransferBytes method to fail, otherwise retries are not
+      // triggered
+      FileDownloader().registerCallbacks(taskStatusCallback: statusCallback);
+      expect(await FileDownloader().enqueue(retryTask), isTrue);
+      await statusCallbackCompleter.future;
+      expect(lastStatus, equals(TaskStatus.failed));
+    });
+
+    test('[*] Range or Known-Content-Length in task header', () async {
+      // modify the getContentLength function to not return a
+      // content length, so that it relies on Range or
+      // Known-Content-Length header to determine content length
+      FileDownloader().registerCallbacks(
+          taskStatusCallback: statusCallback,
+          taskProgressCallback: progressCallback);
+      // try with Range header
+      task = task.copyWith(
+          taskId: "1",
+          url: urlWithContentLength,
+          headers: {'Range': 'bytes=0-${urlWithContentLengthFileSize - 1}'},
+          updates: Updates.statusAndProgress);
+      expect(await FileDownloader().enqueue(task), isTrue);
+      await statusCallbackCompleter.future;
+      expect(lastValidExpectedFileSize, equals(urlWithContentLengthFileSize));
+      // try with Known-Content-Length header
+      statusCallbackCompleter = Completer();
+      lastValidExpectedFileSize = -1;
+      task = task.copyWith(
+          taskId: "2",
+          headers: {'Known-Content-Length': '$urlWithContentLengthFileSize'});
+      expect(await FileDownloader().enqueue(task), isTrue);
+      await statusCallbackCompleter.future;
+      expect(lastValidExpectedFileSize, equals(urlWithContentLengthFileSize));
+      // try without any header, and if the source code mod has been made, this
+      // should fail the task
+      statusCallbackCompleter = Completer();
+      lastValidExpectedFileSize = -1;
+      task = task.copyWith(taskId: "3", headers: {});
+      if (!Platform.isIOS) {
+        expect(await FileDownloader().enqueue(task), isTrue);
+        await statusCallbackCompleter.future;
+        expect(lastStatus, equals(TaskStatus.failed));
+      } else {
+        // on iOS the task fails at enqueue
+        expect(await FileDownloader().enqueue(task), isFalse);
+      }
+    });
+
+    test('[*] override content length', () async {
+      // Haven't found a url that does not provide content-length, so
+      // can only be tested by modifying the source code to ignore the
+      // Content-Length response header and use this one instead
+      FileDownloader().registerCallbacks(taskStatusCallback: statusCallback);
+      task = task.copyWith(
+          url: urlWithContentLength,
+          headers: {'Known-Content-Length': '$urlWithContentLengthFileSize'});
+      expect(await FileDownloader().enqueue(task), isTrue);
+      await statusCallbackCompleter.future;
+      expect(lastStatus, equals(TaskStatus.complete));
+      expect(statusCallbackCounter, equals(3));
+      final file = File(await task.filePath());
+      expect(file.existsSync(), isTrue);
+      expect(await fileEqualsTestFile(file), isTrue);
     });
   });
 }

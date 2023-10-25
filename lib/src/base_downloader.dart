@@ -11,6 +11,7 @@ import 'exceptions.dart';
 import 'models.dart';
 import 'native_downloader.dart';
 import 'persistent_storage.dart';
+import 'queue/task_queue.dart';
 import 'web_downloader.dart'
     if (dart.library.io) 'desktop/desktop_downloader.dart';
 
@@ -63,6 +64,9 @@ abstract base class BaseDownloader {
 
   /// Flag indicating we have retrieved missed data
   var _retrievedLocallyStoredData = false;
+
+  /// Connected TaskQueues that will receive a signal upon task completion
+  final taskQueues = <TaskQueue>[];
 
   BaseDownloader();
 
@@ -413,14 +417,6 @@ abstract base class BaseDownloader {
     removePausedTask(task.taskId);
   }
 
-  /// Get the duration for a task to timeout - Android only, for testing
-  @visibleForTesting
-  Future<Duration> getTaskTimeout();
-
-  /// Set forceFailPostOnBackgroundChannel for native downloader
-  @visibleForTesting
-  Future<void> setForceFailPostOnBackgroundChannel(bool value);
-
   /// Move the file at [filePath] to the shared storage
   /// [destination] and potential subdirectory [directory]
   ///
@@ -463,6 +459,23 @@ abstract base class BaseDownloader {
     }
   }
 
+  // Testing methods
+
+  /// Get the duration for a task to timeout - Android only, for testing
+  @visibleForTesting
+  Future<Duration> getTaskTimeout();
+
+  /// Set forceFailPostOnBackgroundChannel for native downloader
+  @visibleForTesting
+  Future<void> setForceFailPostOnBackgroundChannel(bool value);
+
+  /// Test suggested filename based on task and content disposition header
+  @visibleForTesting
+  Future<String> testSuggestedFilename(
+      DownloadTask task, String contentDisposition);
+
+  // Helper methods
+
   /// Retrieves modified version of the [originalTask] or null
   ///
   /// See [setModifiedTask]
@@ -480,24 +493,6 @@ abstract base class BaseDownloader {
       await updates.close();
     }
     updates = StreamController();
-  }
-
-  /// Destroy - clears callbacks, updates stream and retry queue
-  ///
-  /// Clears all queues and references without sending cancellation
-  /// messages or status updates
-  @mustCallSuper
-  void destroy() {
-    tasksWaitingToRetry.clear();
-    groupStatusCallbacks.clear();
-    groupProgressCallbacks.clear();
-    notificationConfigs.clear();
-    trackedGroups.clear();
-    canResumeTask.clear();
-    removeResumeData(); // removes all
-    removePausedTask(); // removes all
-    removeModifiedTask(); // removes all
-    resetUpdatesStreamController();
   }
 
   /// Process status update coming from Downloader and emit to listener
@@ -548,13 +543,34 @@ abstract base class BaseDownloader {
         removeModifiedTask(task);
         _clearPauseResumeInfo(task);
       }
+      if (update.status.isFinalState || update.status == TaskStatus.paused) {
+        notifyTaskQueues(task);
+      }
       _emitStatusUpdate(update);
     }
   }
 
   /// Process progress update coming from Downloader to client listener
   void processProgressUpdate(TaskProgressUpdate update) {
+    switch (update.progress) {
+      case progressComplete:
+      case progressFailed:
+      case progressNotFound:
+      case progressCanceled:
+      case progressPaused:
+        notifyTaskQueues(update.task);
+
+      default:
+      // no-op
+    }
     _emitProgressUpdate(update);
+  }
+
+  /// Notify all [taskQueues] that this task has finished
+  void notifyTaskQueues(Task task) {
+    for (var taskQueue in taskQueues) {
+      taskQueue.taskFinished(task);
+    }
   }
 
   /// Process user tapping on a notification
@@ -659,5 +675,23 @@ abstract base class BaseDownloader {
             existingRecord?.progress ?? 0, expectedFileSize, taskException));
       }
     }
+  }
+
+  /// Destroy - clears callbacks, updates stream and retry queue
+  ///
+  /// Clears all queues and references without sending cancellation
+  /// messages or status updates
+  @mustCallSuper
+  void destroy() {
+    tasksWaitingToRetry.clear();
+    groupStatusCallbacks.clear();
+    groupProgressCallbacks.clear();
+    notificationConfigs.clear();
+    trackedGroups.clear();
+    canResumeTask.clear();
+    removeResumeData(); // removes all
+    removePausedTask(); // removes all
+    removeModifiedTask(); // removes all
+    resetUpdatesStreamController();
   }
 }

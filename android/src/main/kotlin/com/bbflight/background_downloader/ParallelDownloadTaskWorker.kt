@@ -110,7 +110,8 @@ class ParallelDownloadTaskWorker(applicationContext: Context, workerParams: Work
                             )
                             val errorContent = responseErrorContent(connection)
                             taskException = TaskException(
-                                ExceptionType.httpResponse, httpResponseCode = connection.responseCode,
+                                ExceptionType.httpResponse,
+                                httpResponseCode = connection.responseCode,
                                 description = if (errorContent?.isNotEmpty() == true) errorContent else connection.responseMessage
                             )
                             if (connection.responseCode == 404) {
@@ -181,7 +182,12 @@ class ParallelDownloadTaskWorker(applicationContext: Context, workerParams: Work
     /**
      * Process incoming [status] update for a chunk with [chunkTaskId]
      */
-    suspend fun chunkStatusUpdate(chunkTaskId: String, status: TaskStatus, taskException: TaskException?, responseBody: String?) {
+    suspend fun chunkStatusUpdate(
+        chunkTaskId: String,
+        status: TaskStatus,
+        taskException: TaskException?,
+        responseBody: String?
+    ) {
         val chunk = chunks.firstOrNull { it.task.taskId == chunkTaskId }
             ?: return // chunk is not part of this parent task
         val chunkTask = chunk.task
@@ -238,7 +244,7 @@ class ParallelDownloadTaskWorker(applicationContext: Context, workerParams: Work
      * Process incoming [progress] update for a chunk with [chunkTaskId].
      *
      * Recalculates overall task progress (based on the average of the chunk
-     * task progress) and sends an updatre to the Dart isde and updates the
+     * task progress) and sends an update to the Dart side and updates the
      * notification at the appropriate interval
      */
     suspend fun chunkProgressUpdate(chunkTaskId: String, progress: Double) {
@@ -326,7 +332,7 @@ class ParallelDownloadTaskWorker(applicationContext: Context, workerParams: Work
     /**
      * Pause the tasks associated with each chunk
      *
-     * Accomplished by sending a json ecoded list of tasks to cancel
+     * Accomplished by sending a json decoded list of tasks to cancel
      * to the NativeDownloader
      */
     private suspend fun pauseAllChunkTasks() {
@@ -386,18 +392,22 @@ class ParallelDownloadTaskWorker(applicationContext: Context, workerParams: Work
     }
 
 
+    /**
+     * Returns a list of chunk information for this task, and sets
+     * [parallelDownloadContentLength] to the total length of the download
+     *
+     * Throws a IllegalStateException if any information is missing, which should lead
+     * to a failure of the ParallelDownloadTask
+     */
     private fun createChunks(
         task: Task,
         headers: MutableMap<String, MutableList<String>>
     ): List<Chunk> {
         val numChunks = task.urls.size * task.chunks
         try {
-            val contentLength = headers.entries
-                .first { it.key == "content-length" || it.key == "Content-Length" }
-                .value
-                .first().toLong()
+            val contentLength = getContentLength(headers, task)
             if (contentLength <= 0) {
-                throw IllegalStateException("Server does not provide content length - cannot chunk download")
+                throw IllegalStateException("Server does not provide content length - cannot chunk download. If you know the length, set Range or Known-Content-Length header")
             }
             parallelDownloadContentLength = contentLength
             try {
@@ -417,7 +427,7 @@ class ParallelDownloadTaskWorker(applicationContext: Context, workerParams: Work
                 )
             }
         } catch (e: NoSuchElementException) {
-            throw IllegalStateException("Server does not provide content length - cannot chunk download")
+            throw IllegalStateException("Server does not provide content length - cannot chunk download. If you know the length, set Range or Known-Content-Length header")
         }
     }
 }
@@ -466,7 +476,8 @@ class Chunk(
             retries = parentTask.retries,
             retriesRemaining = parentTask.retries,
             requiresWiFi = parentTask.requiresWiFi,
-            allowPause = true,
+            allowPause = parentTask.allowPause,
+            priority = parentTask.priority,
             metaData = gson.toJson(
                 mapOf("parentTaskId" to parentTask.taskId, "from" to from, "to" to to)
             ),

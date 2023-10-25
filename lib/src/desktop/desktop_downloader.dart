@@ -29,9 +29,9 @@ const okResponses = [200, 201, 202, 203, 204, 205, 206];
 /// WorkManager as there is on iOS and Android
 final class DesktopDownloader extends BaseDownloader {
   static final _log = Logger('DesktopDownloader');
-  final maxConcurrent = 5;
+  final maxConcurrent = 10;
   static final DesktopDownloader _singleton = DesktopDownloader._internal();
-  final _queue = Queue<Task>();
+  final _queue = PriorityQueue<Task>();
   final _running = Queue<Task>(); // subset that is running
   final _resume = <Task>{};
   final _isolateSendPorts =
@@ -103,6 +103,7 @@ final class DesktopDownloader extends BaseDownloader {
           TaskException('Could not obtain rootIsolateToken')));
       return;
     }
+    log.finer('${isResume ? "Resuming" : "Starting"} taskId ${task.taskId}');
     await Isolate.spawn(doTask, (rootIsolateToken, receivePort.sendPort),
         onError: errorPort.sendPort);
     final messagesFromIsolate = StreamQueue<dynamic>(receivePort);
@@ -124,6 +125,8 @@ final class DesktopDownloader extends BaseDownloader {
     // cancellation, and for managing parallel downloads
     _isolateSendPorts[task] = sendPort;
     // listen for messages sent back from the isolate, until 'done'
+    // note that the task sent by the isolate may have changed. Therefore, we
+    // use updatedTask instead of task from here on
     while (await messagesFromIsolate.hasNext) {
       final message = await messagesFromIsolate.next;
       switch (message) {
@@ -132,35 +135,37 @@ final class DesktopDownloader extends BaseDownloader {
 
         case (
             'statusUpdate',
+            Task updatedTask,
             TaskStatus status,
             TaskException? exception,
             String? responseBody
           ):
-          final taskStatusUpdate = TaskStatusUpdate(task, status,
+          final taskStatusUpdate = TaskStatusUpdate(updatedTask, status,
               status == TaskStatus.failed ? exception : null, responseBody);
-          if (task.group != BaseDownloader.chunkGroup) {
+          if (updatedTask.group != BaseDownloader.chunkGroup) {
             if (status.isFinalState) {
-              _remove(task);
+              _remove(updatedTask);
             }
             processStatusUpdate(taskStatusUpdate);
           } else {
-            _parallelTaskSendPort(Chunk.getParentTaskId(task))
+            _parallelTaskSendPort(Chunk.getParentTaskId(updatedTask))
                 ?.send(taskStatusUpdate);
           }
 
         case (
             'progressUpdate',
+            Task updatedTask,
             double progress,
             int expectedFileSize,
             double downloadSpeed,
             Duration timeRemaining
           ):
-          final taskProgressUpdate = TaskProgressUpdate(
-              task, progress, expectedFileSize, downloadSpeed, timeRemaining);
-          if (task.group != BaseDownloader.chunkGroup) {
+          final taskProgressUpdate = TaskProgressUpdate(updatedTask, progress,
+              expectedFileSize, downloadSpeed, timeRemaining);
+          if (updatedTask.group != BaseDownloader.chunkGroup) {
             processProgressUpdate(taskProgressUpdate);
           } else {
-            _parallelTaskSendPort(Chunk.getParentTaskId(task))
+            _parallelTaskSendPort(Chunk.getParentTaskId(updatedTask))
                 ?.send(taskProgressUpdate);
           }
 
@@ -232,8 +237,9 @@ final class DesktopDownloader extends BaseDownloader {
   @override
   Future<int> reset(String group) async {
     final retryAndPausedTaskCount = await super.reset(group);
-    final inQueueIds =
-        _queue.where((task) => task.group == group).map((task) => task.taskId);
+    final inQueueIds = _queue.unorderedElements
+        .where((task) => task.group == group)
+        .map((task) => task.taskId);
     final runningIds = _running
         .where((task) => task.group == group)
         .map((task) => task.taskId);
@@ -249,7 +255,8 @@ final class DesktopDownloader extends BaseDownloader {
       String group, bool includeTasksWaitingToRetry) async {
     final retryAndPausedTasks =
         await super.allTasks(group, includeTasksWaitingToRetry);
-    final inQueue = _queue.where((task) => task.group == group);
+    final inQueue =
+        _queue.unorderedElements.where((task) => task.group == group);
     final running = _running.where((task) => task.group == group);
     return [...retryAndPausedTasks, ...inQueue, ...running];
   }
@@ -259,7 +266,7 @@ final class DesktopDownloader extends BaseDownloader {
   /// Returns true if all cancellations were successful
   @override
   Future<bool> cancelPlatformTasksWithIds(List<String> taskIds) async {
-    final inQueue = _queue
+    final inQueue = _queue.unorderedElements
         .where((task) => taskIds.contains(task.taskId))
         .toList(growable: false);
     for (final task in inQueue) {
@@ -291,7 +298,9 @@ final class DesktopDownloader extends BaseDownloader {
       return _running.where((task) => task.taskId == taskId).first;
     } on StateError {
       try {
-        return _queue.where((task) => task.taskId == taskId).first;
+        return _queue.unorderedElements
+            .where((task) => task.taskId == taskId)
+            .first;
       } on StateError {
         return null;
       }
@@ -329,14 +338,6 @@ final class DesktopDownloader extends BaseDownloader {
   @override
   Future<Map<String, dynamic>> popUndeliveredData(Undelivered dataType) =>
       Future.value({});
-
-  @override
-  Future<Duration> getTaskTimeout() => Future.value(const Duration(days: 1));
-
-  @override
-  Future<void> setForceFailPostOnBackgroundChannel(bool value) {
-    throw UnimplementedError();
-  }
 
   @override
   Future<String?> moveToSharedStorage(String filePath,
@@ -414,6 +415,24 @@ final class DesktopDownloader extends BaseDownloader {
           'openFile command $executable returned exit code ${result.exitCode}');
     }
     return result.exitCode == 0;
+  }
+
+  @override
+  Future<Duration> getTaskTimeout() => Future.value(const Duration(days: 1));
+
+  @override
+  Future<void> setForceFailPostOnBackgroundChannel(bool value) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<String> testSuggestedFilename(
+      DownloadTask task, String contentDisposition) async {
+    final h = contentDisposition.isNotEmpty
+        ? {'Content-disposition': contentDisposition}
+        : <String, String>{};
+    final t = await taskWithSuggestedFilename(task, h, false);
+    return t.filename;
   }
 
   @override

@@ -10,6 +10,7 @@ import 'package:path_provider/path_provider.dart';
 
 import 'exceptions.dart';
 import 'file_downloader.dart';
+import 'utils.dart';
 import 'web_downloader.dart'
     if (dart.library.io) 'desktop/desktop_downloader.dart';
 
@@ -235,6 +236,10 @@ base class Request {
   /// Decrease [retriesRemaining] by one
   void decreaseRetriesRemaining() => retriesRemaining--;
 
+  /// Hostname represented by the url. Throws [FormatException] if url cannot
+  /// be parsed, and returns empty string if no host in url
+  String get hostName => Uri.parse(url).host;
+
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
@@ -262,7 +267,7 @@ final _startsWithPathSeparator = RegExp(r'^[/\\]');
 ///
 /// An equality test on a [Task] is a test on the [taskId]
 /// only - all other fields are ignored in that test
-sealed class Task extends Request {
+sealed class Task extends Request implements Comparable {
   /// Identifier for the task - auto generated if omitted
   final String taskId;
 
@@ -291,11 +296,19 @@ sealed class Task extends Request {
   /// If false, task fails on any issue, and task cannot be paused
   final bool allowPause;
 
-  /// User-defined metadata - use {meteData} in notification
+  /// Priority of this task, relative to other tasks.
+  /// Range 0 <= priority <= 10 with 0 being the highest priority.
+  /// Not all platforms will have the same actual granularity, and how
+  /// priority is considered is inconsistent across platforms.
+  final int priority;
+
+  /// User-defined metadata - use {metaData} in notification
   final String metaData;
 
   /// Human readable name for this task - use {displayName} in notification
   final String displayName;
+
+  static bool useExternalStorage = false; // for Android configuration only
 
   /// Creates a [Task]
   ///
@@ -324,7 +337,9 @@ sealed class Task extends Request {
   /// when some but not all bytes have transferred, provided the server supports
   /// partial transfers. Such failures are typically temporary, eg due to
   /// connectivity issues, and may be resumed when connectivity returns
+  /// [priority] in range 0 <= priority <= 10 with 0 highest, defaults to 5
   /// [metaData] user data
+  /// [displayName] human readable name for this task
   /// [creationTime] time of task creation, 'now' by default.
   Task(
       {String? taskId,
@@ -343,6 +358,7 @@ sealed class Task extends Request {
       this.metaData = '',
       this.displayName = '',
       this.allowPause = false,
+      this.priority = 5,
       super.creationTime})
       : taskId = taskId ?? Random().nextInt(1 << 32).toString(),
         filename = filename ?? Random().nextInt(1 << 32).toString() {
@@ -358,6 +374,9 @@ sealed class Task extends Request {
     }
     if (allowPause && post != null) {
       throw ArgumentError('Tasks that can pause must be GET requests');
+    }
+    if (priority < 0 || priority > 10) {
+      throw ArgumentError('Priority must be 0 <= priority <= 10');
     }
   }
 
@@ -378,19 +397,42 @@ sealed class Task extends Request {
   /// If the task is a MultiUploadTask and no [withFilename] is given,
   /// returns the empty string, as there is no single path that can be
   /// returned.
+  ///
+  /// Throws a FileSystemException if using external storage on Android (via
+  /// configuration at startup), and external storage is not available.
   Future<String> filePath({String? withFilename}) async {
     if (this is MultiUploadTask && withFilename == null) {
       return '';
     }
-    final Directory baseDir = await switch (baseDirectory) {
-      BaseDirectory.applicationDocuments => getApplicationDocumentsDirectory(),
-      BaseDirectory.temporary => getTemporaryDirectory(),
-      BaseDirectory.applicationSupport => getApplicationSupportDirectory(),
-      BaseDirectory.applicationLibrary
+    Directory? externalStorageDirectory;
+    Directory? externalCacheDirectory;
+    if (Task.useExternalStorage) {
+      externalStorageDirectory = await getExternalStorageDirectory();
+      externalCacheDirectory = (await getExternalCacheDirectories())?.first;
+      if (externalStorageDirectory == null || externalCacheDirectory == null) {
+        throw const FileSystemException(
+            'Android external storage is not available');
+      }
+    }
+    final Directory baseDir =
+        switch ((baseDirectory, Task.useExternalStorage)) {
+      (BaseDirectory.applicationDocuments, false) =>
+        await getApplicationDocumentsDirectory(),
+      (BaseDirectory.temporary, false) => await getTemporaryDirectory(),
+      (BaseDirectory.applicationSupport, false) =>
+        await getApplicationSupportDirectory(),
+      (BaseDirectory.applicationLibrary, false)
           when Platform.isMacOS || Platform.isIOS =>
-        getLibraryDirectory(),
-      BaseDirectory.applicationLibrary => Future.value(Directory(
-          path.join((await getApplicationSupportDirectory()).path, 'Library')))
+        await getLibraryDirectory(),
+      (BaseDirectory.applicationLibrary, false) => Directory(
+          path.join((await getApplicationSupportDirectory()).path, 'Library')),
+      // Android only: external storage variants
+      (BaseDirectory.applicationDocuments, true) => externalStorageDirectory!,
+      (BaseDirectory.temporary, true) => externalCacheDirectory!,
+      (BaseDirectory.applicationSupport, true) =>
+        Directory(path.join(externalStorageDirectory!.path, 'Support')),
+      (BaseDirectory.applicationLibrary, true) =>
+        Directory(path.join(externalStorageDirectory!.path, 'Library'))
     };
     return path.join(baseDir.path, directory, withFilename ?? filename);
   }
@@ -411,6 +453,7 @@ sealed class Task extends Request {
       int? retries,
       int? retriesRemaining,
       bool? allowPause,
+      int? priority,
       String? metaData,
       String? displayName,
       DateTime? creationTime});
@@ -429,6 +472,7 @@ sealed class Task extends Request {
         updates = Updates.values[(jsonMap['updates'] as num?)?.toInt() ?? 0],
         requiresWiFi = jsonMap['requiresWiFi'] ?? false,
         allowPause = jsonMap['allowPause'] ?? false,
+        priority = (jsonMap['updates'] as num?)?.toInt() ?? 5,
         metaData = jsonMap['metaData'] ?? '',
         displayName = jsonMap['displayName'] ?? '',
         super.fromJsonMap(jsonMap);
@@ -445,6 +489,7 @@ sealed class Task extends Request {
         'updates': updates.index, // stored as int
         'requiresWiFi': requiresWiFi,
         'allowPause': allowPause,
+        'priority': priority,
         'metaData': metaData,
         'displayName': displayName,
         'taskType': taskType
@@ -474,9 +519,25 @@ sealed class Task extends Request {
   int get hashCode => taskId.hashCode;
 
   @override
+
+  /// Returns this.priority - other.priority if not the same
+  /// Returns this.creationTime - other.creationTime if priorities the same
+  /// Returns 0 if other is not a [Task]
+  int compareTo(other) {
+    if (other is Task) {
+      final diff = priority - other.priority;
+      if (diff != 0) {
+        return diff;
+      }
+      return creationTime.difference(other.creationTime).inMicroseconds;
+    }
+    return 0;
+  }
+
+  @override
   String toString() {
     return '$taskType{taskId: $taskId, url: $url, filename: $filename, headers: '
-        '$headers, httpRequestMethod: $httpRequestMethod, post: ${post == null ? "null" : "not null"}, directory: $directory, baseDirectory: $baseDirectory, group: $group, updates: $updates, requiresWiFi: $requiresWiFi, retries: $retries, retriesRemaining: $retriesRemaining, allowPause: $allowPause, metaData: $metaData}';
+        '$headers, httpRequestMethod: $httpRequestMethod, post: ${post == null ? "null" : "not null"}, directory: $directory, baseDirectory: $baseDirectory, group: $group, updates: $updates, requiresWiFi: $requiresWiFi, retries: $retries, retriesRemaining: $retriesRemaining, allowPause: $allowPause, priority: $priority, metaData: $metaData, displayName: $displayName}';
   }
 }
 
@@ -513,7 +574,9 @@ final class DownloadTask extends Task {
   /// If not set may start download over cellular network
   /// [retries] if >0 will retry a failed download this many times
   /// [allowPause] if true, allows pause command
+  /// [priority] in range 0 <= priority <= 10 with 0 highest, defaults to 5
   /// [metaData] user data
+  /// [displayName] human readable name for this task
   /// [creationTime] time of task creation, 'now' by default.
   DownloadTask(
       {super.taskId,
@@ -530,6 +593,7 @@ final class DownloadTask extends Task {
       super.requiresWiFi,
       super.retries,
       super.allowPause,
+      super.priority,
       super.metaData,
       super.displayName,
       super.creationTime});
@@ -562,6 +626,7 @@ final class DownloadTask extends Task {
           int? retries,
           int? retriesRemaining,
           bool? allowPause,
+          int? priority,
           String? metaData,
           String? displayName,
           DateTime? creationTime}) =>
@@ -579,6 +644,7 @@ final class DownloadTask extends Task {
           requiresWiFi: requiresWiFi ?? this.requiresWiFi,
           retries: retries ?? this.retries,
           allowPause: allowPause ?? this.allowPause,
+          priority: priority ?? this.priority,
           metaData: metaData ?? this.metaData,
           displayName: displayName ?? this.displayName,
           creationTime: creationTime ?? this.creationTime)
@@ -591,86 +657,29 @@ final class DownloadTask extends Task {
   /// If [unique] is true, the filename is guaranteed not to already exist. This
   /// is accomplished by adding a suffix to the suggested filename with a number,
   /// e.g. "data (2).txt"
+  /// If a [taskWithFilenameBuilder] is supplied, this is the function called to
+  /// convert the task, response headers and [unique] values into a new [DownloadTask]
+  /// with the suggested filename. By default, [taskWithSuggestedFilename] is used,
+  /// which parses the Content-Disposition according to RFC6266, or takes the last
+  /// path segment of the URL, or leaves the filename unchanged
   ///
   /// The suggested filename is obtained by making a HEAD request to the url
   /// represented by the [DownloadTask], including urlQueryParameters and headers
-  Future<DownloadTask> withSuggestedFilename({unique = false}) async {
-    /// Returns [DownloadTask] with a filename similar to the one
-    /// supplied, but unused.
-    ///
-    /// If [unique], filename will sequence up in "filename (8).txt" format,
-    /// otherwise returns the [task]
-    Future<DownloadTask> uniqueFilename(DownloadTask task, bool unique) async {
-      if (!unique) {
-        return task;
-      }
-      final sequenceRegEx = RegExp(r'\((\d+)\)\.?[^.]*$');
-      final extensionRegEx = RegExp(r'\.[^.]*$');
-      var newTask = task;
-      var filePath = await newTask.filePath();
-      var exists = await File(filePath).exists();
-      while (exists) {
-        final extension =
-            extensionRegEx.firstMatch(newTask.filename)?.group(0) ?? '';
-        final match = sequenceRegEx.firstMatch(newTask.filename);
-        final newSequence = int.parse(match?.group(1) ?? "0") + 1;
-        final newFilename = match == null
-            ? '${path.basenameWithoutExtension(newTask.filename)} ($newSequence)$extension'
-            : '${newTask.filename.substring(0, match.start - 1)} ($newSequence)$extension';
-        newTask = newTask.copyWith(filename: newFilename);
-        filePath = await newTask.filePath();
-        exists = await File(filePath).exists();
-      }
-      return newTask;
-    }
-
+  Future<DownloadTask> withSuggestedFilename(
+      {unique = false,
+      Future<DownloadTask> Function(
+              DownloadTask task, Map<String, String> headers, bool unique)
+          taskWithFilenameBuilder = taskWithSuggestedFilename}) async {
     try {
       final response = await DesktopDownloader.httpClient
           .head(Uri.parse(url), headers: headers);
       if ([200, 201, 202, 203, 204, 205, 206].contains(response.statusCode)) {
-        final disposition = response.headers.entries
-            .firstWhere(
-                (element) => element.key.toLowerCase() == 'content-disposition')
-            .value;
-        // Try filename="filename"
-        final plainFilenameRegEx =
-            RegExp(r'filename="?([^"]+)"?.*$', caseSensitive: false);
-        var match = plainFilenameRegEx.firstMatch(disposition);
-        if (match != null && match.group(1)?.isNotEmpty == true) {
-          return uniqueFilename(copyWith(filename: match.group(1)), unique);
-        }
-        // Try filename*=UTF-8'language'"encodedFilename"
-        final encodedFilenameRegEx = RegExp(
-            'filename\\*=([^\']+)\'([^\']*)\'"?([^"]+)"?',
-            caseSensitive: false);
-        match = encodedFilenameRegEx.firstMatch(disposition);
-        if (match != null &&
-            match.group(1)?.isNotEmpty == true &&
-            match.group(3)?.isNotEmpty == true) {
-          try {
-            final suggestedFilename = match.group(1) == 'UTF-8'
-                ? Uri.decodeComponent(match.group(3)!)
-                : match.group(3)!;
-            return uniqueFilename(copyWith(filename: suggestedFilename), true);
-          } on ArgumentError {
-            _log.finer(
-                'Could not interpret suggested filename (UTF-8 url encoded) ${match.group(3)}');
-          }
-        }
+        return taskWithFilenameBuilder(this, response.headers, unique);
       }
     } catch (e) {
-      _log.finer('Could not determine suggested filename from server');
+      _log.finer('Error connecting to server');
     }
-    // Try filename derived from last path segment of the url
-    try {
-      final suggestedFilename = Uri.parse(url).pathSegments.last;
-      return uniqueFilename(copyWith(filename: suggestedFilename), unique);
-    } catch (e) {
-      _log.finer('Could not parse URL pathSegment for suggested filename: $e');
-    }
-    // if everything fails, return the task with unchanged filename
-    // except for possibly making it unique
-    return uniqueFilename(this, unique);
+    return taskWithFilenameBuilder(this, {}, unique);
   }
 
   /// Return the expected file size for this task, or -1 if unknown
@@ -682,16 +691,19 @@ final class DownloadTask extends Task {
       final response = await DesktopDownloader.httpClient
           .head(Uri.parse(url), headers: headers);
       if ([200, 201, 202, 203, 204, 205, 206].contains(response.statusCode)) {
-        return int.parse(response.headers.entries
-            .firstWhere(
-                (element) => element.key.toLowerCase() == 'content-length')
-            .value);
+        return getContentLength(response.headers, this);
       }
     } catch (e) {
       // no content length available
     }
     return -1;
   }
+
+  /// Constant used with `filename` field to indicate server suggestion requested
+  static const suggestedFilename = '?';
+
+  /// True if this task has a filename, or false if set to `suggest`
+  bool get hasFilename => filename != suggestedFilename;
 }
 
 /// Information related to an upload task
@@ -731,8 +743,10 @@ final class UploadTask extends Task {
   /// [updates] the kind of progress updates requested
   /// [requiresWiFi] if set, will not start upload until WiFi is available.
   /// If not set may start upload over cellular network
+  /// [priority] in range 0 <= priority <= 10 with 0 highest, defaults to 5
   /// [retries] if >0 will retry a failed upload this many times
   /// [metaData] user data
+  /// [displayName] human readable name for this task
   /// [creationTime] time of task creation, 'now' by default.
   UploadTask(
       {super.taskId,
@@ -751,6 +765,7 @@ final class UploadTask extends Task {
       super.updates,
       super.requiresWiFi,
       super.retries,
+      super.priority,
       super.metaData,
       super.displayName,
       super.creationTime})
@@ -839,6 +854,7 @@ final class UploadTask extends Task {
           int? retries,
           int? retriesRemaining,
           bool? allowPause,
+          int? priority,
           String? metaData,
           String? displayName,
           DateTime? creationTime}) =>
@@ -857,6 +873,7 @@ final class UploadTask extends Task {
           group: group ?? this.group,
           updates: updates ?? this.updates,
           requiresWiFi: requiresWiFi ?? this.requiresWiFi,
+          priority: priority ?? this.priority,
           retries: retries ?? this.retries,
           metaData: metaData ?? this.metaData,
           displayName: displayName ?? this.displayName,
@@ -920,8 +937,10 @@ final class MultiUploadTask extends UploadTask {
   /// [updates] the kind of progress updates requested
   /// [requiresWiFi] if set, will not start upload until WiFi is available.
   /// If not set may start upload over cellular network
+  /// [priority] in range 0 <= priority <= 10 with 0 highest, defaults to 5
   /// [retries] if >0 will retry a failed upload this many times
   /// [metaData] user data
+  /// [displayName] human readable name for this task
   /// [creationTime] time of task creation, 'now' by default.
   MultiUploadTask(
       {super.taskId,
@@ -936,6 +955,7 @@ final class MultiUploadTask extends UploadTask {
       super.group,
       super.updates,
       super.requiresWiFi,
+      super.priority,
       super.retries,
       super.metaData,
       super.displayName,
@@ -1013,6 +1033,7 @@ final class MultiUploadTask extends UploadTask {
           String? group,
           Updates? updates,
           bool? requiresWiFi,
+          int? priority,
           int? retries,
           int? retriesRemaining,
           bool? allowPause,
@@ -1031,6 +1052,7 @@ final class MultiUploadTask extends UploadTask {
           group: group ?? this.group,
           updates: updates ?? this.updates,
           requiresWiFi: requiresWiFi ?? this.requiresWiFi,
+          priority: priority ?? this.priority,
           retries: retries ?? this.retries,
           metaData: metaData ?? this.metaData,
           displayName: displayName ?? this.displayName,
@@ -1080,7 +1102,9 @@ final class ParallelDownloadTask extends DownloadTask {
   /// If not set may start download over cellular network
   /// [retries] if >0 will retry a failed download this many times
   /// [allowPause] if true, allows pause command
+  /// [priority] in range 0 <= priority <= 10 with 0 highest, defaults to 5
   /// [metaData] user data
+  /// [displayName] human readable name for this task
   /// [creationTime] time of task creation, 'now' by default.
   ///
   /// A [ParallelDownloadTask] cannot be paused or resumed on failure
@@ -1099,6 +1123,7 @@ final class ParallelDownloadTask extends DownloadTask {
       super.requiresWiFi,
       super.retries,
       super.allowPause,
+      super.priority,
       super.metaData,
       super.displayName,
       super.creationTime})
@@ -1147,6 +1172,7 @@ final class ParallelDownloadTask extends DownloadTask {
           int? retries,
           int? retriesRemaining,
           bool? allowPause,
+          int? priority,
           String? metaData,
           String? displayName,
           DateTime? creationTime}) =>
@@ -1164,6 +1190,7 @@ final class ParallelDownloadTask extends DownloadTask {
           requiresWiFi: requiresWiFi ?? this.requiresWiFi,
           retries: retries ?? this.retries,
           allowPause: allowPause ?? this.allowPause,
+          priority: priority ?? this.priority,
           metaData: metaData ?? this.metaData,
           displayName: displayName ?? this.displayName,
           creationTime: creationTime ?? this.creationTime)
@@ -1523,11 +1550,12 @@ final class Config {
       'runInForegroundIfFileLargerThan';
   static const localize = 'localize';
   static const useCacheDir = 'useCacheDir';
+  static const useExternalStorage = 'useExternalStorage';
 
   // Config arguments
-  static const always = 'always'; // int 0
-  static const never = 'never'; // int -1
-  static const whenAble = 'whenAble'; // int -2
+  static const always = 'always'; // int 0 on native side
+  static const never = 'never'; // int -1 on native side
+  static const whenAble = 'whenAble'; // int -2 on native side
 
   /// Returns the int equivalent of commonly used String arguments
   ///
@@ -1540,4 +1568,92 @@ final class Config {
     }
     return value;
   }
+}
+
+// helper function for DownloadTask
+
+/// Returns a copy of the [task] with the [Task.filename] property changed
+/// to the filename suggested by the server, or derived from the url, or
+/// unchanged.
+///
+/// If [unique] is true, the filename is guaranteed not to already exist. This
+/// is accomplished by adding a suffix to the suggested filename with a number,
+/// e.g. "data (2).txt"
+///
+/// The server-suggested filename is obtained from the  [responseHeaders] entry
+/// "Content-Disposition" according to RFC6266, or the last path segment of the
+/// URL, or leaves the filename unchanged
+Future<DownloadTask> taskWithSuggestedFilename(
+    DownloadTask task, Map<String, String> responseHeaders, bool unique) {
+  /// Returns [DownloadTask] with a filename similar to the one
+  /// supplied, but unused.
+  ///
+  /// If [unique], filename will sequence up in "filename (8).txt" format,
+  /// otherwise returns the [task]
+  Future<DownloadTask> uniqueFilename(DownloadTask task, bool unique) async {
+    if (!unique) {
+      return task;
+    }
+    final sequenceRegEx = RegExp(r'\((\d+)\)\.?[^.]*$');
+    final extensionRegEx = RegExp(r'\.[^.]*$');
+    var newTask = task;
+    var filePath = await newTask.filePath();
+    var exists = await File(filePath).exists();
+    while (exists) {
+      final extension =
+          extensionRegEx.firstMatch(newTask.filename)?.group(0) ?? '';
+      final match = sequenceRegEx.firstMatch(newTask.filename);
+      final newSequence = int.parse(match?.group(1) ?? "0") + 1;
+      final newFilename = match == null
+          ? '${path.basenameWithoutExtension(newTask.filename)} ($newSequence)$extension'
+          : '${newTask.filename.substring(0, match.start - 1)} ($newSequence)$extension';
+      newTask = newTask.copyWith(filename: newFilename);
+      filePath = await newTask.filePath();
+      exists = await File(filePath).exists();
+    }
+    return newTask;
+  }
+
+  // start of main function
+  try {
+    final disposition = responseHeaders.entries
+        .firstWhere(
+            (element) => element.key.toLowerCase() == 'content-disposition')
+        .value;
+    // Try filename="filename"
+    final plainFilenameRegEx =
+        RegExp(r'filename=\s*"?([^"]+)"?.*$', caseSensitive: false);
+    var match = plainFilenameRegEx.firstMatch(disposition);
+    if (match != null && match.group(1)?.isNotEmpty == true) {
+      return uniqueFilename(task.copyWith(filename: match.group(1)), unique);
+    }
+    // Try filename*=UTF-8'language'"encodedFilename"
+    final encodedFilenameRegEx = RegExp(
+        'filename\\*=\\s*([^\']+)\'([^\']*)\'"?([^"]+)"?',
+        caseSensitive: false);
+    match = encodedFilenameRegEx.firstMatch(disposition);
+    if (match != null &&
+        match.group(1)?.isNotEmpty == true &&
+        match.group(3)?.isNotEmpty == true) {
+      try {
+        final suggestedFilename = match.group(1)?.toUpperCase() == 'UTF-8'
+            ? Uri.decodeComponent(match.group(3)!)
+            : match.group(3)!;
+        return uniqueFilename(task.copyWith(filename: suggestedFilename), true);
+      } on ArgumentError {
+        _log.finest(
+            'Could not interpret suggested filename (UTF-8 url encoded) ${match.group(3)}');
+      }
+    }
+  } catch (_) {}
+  _log.finest('Could not determine suggested filename from server');
+  // Try filename derived from last path segment of the url
+  try {
+    final suggestedFilename = Uri.parse(task.url).pathSegments.last;
+    return uniqueFilename(task.copyWith(filename: suggestedFilename), unique);
+  } catch (_) {}
+  _log.finest('Could not parse URL pathSegment for suggested filename');
+  // if everything fails, return the task with unchanged filename
+  // except for possibly making it unique
+  return uniqueFilename(task, unique);
 }

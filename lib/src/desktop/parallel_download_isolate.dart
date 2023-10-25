@@ -9,6 +9,7 @@ import 'package:collection/collection.dart';
 import '../chunk.dart';
 import '../exceptions.dart';
 import '../models.dart';
+import '../utils.dart';
 import 'desktop_downloader.dart';
 import 'isolate.dart';
 
@@ -349,12 +350,11 @@ List<Chunk> createChunks(
     ParallelDownloadTask task, Map<String, String> headers) {
   try {
     final numChunks = task.urls.length * task.chunks;
-    final contentLength = int.parse(headers.entries
-        .firstWhere((element) => element.key.toLowerCase() == 'content-length')
-        .value);
+    final contentLength = getContentLength(headers, task);
     if (contentLength <= 0) {
       throw StateError(
-          'Server does not provide content length - cannot chunk download');
+          'Server does not provide content length - cannot chunk download. '
+          'If you know the length, set Range or Known-Content-Length header');
     }
     parallelDownloadContentLength = contentLength;
     try {
@@ -376,6 +376,7 @@ List<Chunk> createChunks(
     ];
   } on StateError {
     throw StateError(
-        'Server does not provide content length - cannot chunk download');
+        'Server does not provide content length - cannot chunk download. '
+        'If you know the length, set Range or Known-Content-Length header');
   }
 }

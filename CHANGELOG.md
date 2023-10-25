@@ -1,3 +1,85 @@
+## 7.12.2
+
+Minor improvements to `TaskQueue` and `MemoryTaskQueue`
+
+## 7.12.1
+
+Bug fix for web compilation
+
+## 7.12.0
+
+### Task priority levels
+
+The `Task.priority` field must be 0 <= priority <= 10 with 0 being the highest priority, and defaults to 5. On Desktop and iOS all priority levels are supported. On Android, priority levels <5 are handled as 'expedited', and >=5 is handled as a normal task.
+
+### Task queues
+
+Once you `enqueue` a task with the `FileDownloader` it is added to an internal queue that is managed by the native platform you're running on (e.g. Android). Once enqueued, you have limited control over the execution order, the number of tasks running in parallel, etc, because all that is managed by the platform.  If you want more control over the queue, you need to add a `TaskQueue`.
+
+The `MemoryTaskQueue` bundled with the `background_downloader` allows:
+* pacing the rate of enqueueing tasks, based on `minInterval`, to avoid 'choking' the FileDownloader when adding a large number of tasks
+* managing task priorities while waiting in the queue, such that higher priority tasks are enqueued before lower priority ones
+* managing the total number of tasks running concurrently, by setting `maxConcurrent`
+* managing the number of tasks that talk to the same host concurrently, by setting `maxConcurrentByHost`
+* managing the number of tasks running that are in the same `Task.group`, by setting `maxConcurrentByGroup`
+
+A `TaskQueue` conceptually sits 'before' the FileDownloader's queue. To use it, add it to the `FileDownloader` and instead of enqueuing tasks with the `FileDownloader`, you now `add` tasks to the queue:
+```dart
+final tq = MemoryTaskQueue();
+tq.maxConcurrent = 5; // no more than 5 tasks active at any one time
+tq.maxConcurrentByHost = 2; // no more than two tasks talking to the same host at the same time
+tq.maxConcurrentByGroup = 3; // no more than three tasks from the same group active at the same time
+FileDownloader().add(tq); // 'connects' the TaskQueue to the FileDownloader
+FileDownloader().updates.listen((update) { // listen to updates as per usual
+  print('Received update for ${update.task.taskId}: $update')
+});
+for (var n = 0; n < 100; n++) {
+  task = DownloadTask(url: workingUrl, metData: 'task #$n'); // define task
+  tq.add(task); // add to queue. The queue makes the FileDownloader().enqueue call
+}
+```
+
+Because it is possible that an error occurs when the taskQueue eventually actually enqueues the task with the FileDownloader, you can listen to the `enqueueErrors` stream for tasks that failed to enqueue.
+
+The default `TaskQueue` is the `MemoryTaskQueue` which, as the  name suggests, keeps everything in memory. This is fine for most situations, but be aware that the queue may get dropped if the OS aggressively moves the app to the background. Tasks still waiting in the queue will not be enqueued, and will therefore be lost. If you want a `TaskQueue` with more persistence, subclass the `MemoryTaskQueue` and add persistence.
+In addition, if your app is supended by the OS due to resource constraints, tasks waiting in the queue will not be enqueued to the native platform and will not run in the background. TaskQueues are therefore best for situations where you expect the queue to be emptied while the app is still in the foreground.
+
+
+## 7.11.1
+
+Fix #164 for progress updates for uploads.
+
+## 7.11.0
+
+### Android external storage
+Add configuration for Android to use external storage instead of internal storage. Either your app runs in default (internal storage) mode, or in external storage. You cannot switch between internal and external, as the directory structure that - for example - `BaseDirectory.applicationDocuments` refers to is different in each mode. See the [configuration document](https://github.com/781flyingdutchman/background_downloader/blob/main/CONFIG.md) for important details and limitations
+
+Use `(Config.useExternalStorage, String whenToUse)` with values 'never' or 'always'. Default is `Config.never`.
+
+### Server suggested filename
+If you want the filename to be provided by the server (instead of assigning a value to `filename` yourself), you now have two options. The first is to create a `DownloadTask` that pings the server to determine the suggested filename:
+```dart
+final task = await DownloadTask(url: 'https://google.com')
+        .withSuggestedFilename(unique: true);
+```
+The method `withSuggestedFilename` returns a copy of the task it is called on, with the `filename` field modified based on the filename suggested by the server, or the last path segment of the URL, or unchanged if neither is feasible (e.g. due to a lack of connection). If `unique` is true, the filename will be modified such that it does not conflict with an existing filename by adding a sequence. For example "file.txt" would become "file (1).txt". You can now also supply a `taskWithFilenameBuilder` to suggest the filename yourself, based on response headers.
+
+The second approach is to set the `filename` field of the `DownloadTask` to `DownloadTask.suggestedFilename`, to indicate that you would like the server to suggest the name. In this case, you will receive the name via the task's status and/or progress updates, so you have to be careful _not_ to use the original task's filename, as that will still be `DownloadTask.suggestedFilename`. For example:
+```dart
+final task = await DownloadTask(url: 'https://google.com', filename: DownloadTask.suggestedFilename);
+final result = await FileDownloader().download(task);
+print('Suggested filename=${result.task.filename}'); // note we don't use 'task', but 'result.task'
+print('Wrong use filename=${task.filename}'); // this will print '?' as 'task' hasn't changed
+```
+
+### Set content length if not provided by server
+
+To provide progress updates (as a percentage of total file size) the downloader needs to know the size of the file when starting the download. Most servers provide this in the "Content-Length" header of their response. If the server does not provide the file size, yet you know the file size (e.g. because you have stored the file on the server yourself), then you can let the downloader know by providing a `{'Range': 'bytes=0-999'}` or a `{'Known-Content-Length': '1000'}` header to the task's `header` field. Both examples are for a content length of 1000 bytes.  The downloader will assume this content length when calculating progress.
+
+### Bug fix
+
+Partial Downloads, using a Range header, can now be properly paused on all platforms.
+
 ## 7.10.1
 
 Add `displayName` field to `Task` that can be used to store and dsipay a 'human readable' description of the task. It can be displayed in a notification using {displayName}.
@@ -6,7 +88,7 @@ Bug fix for regression in compiling for Web platform (through stubbing - no actu
 
 ## 7.10.0
 
-Add `ParallelDownloadTask`. Some servers may offer an option to download part of the same file from multiple URLs or have multiple parallel downloads of part of a large file using a single URL. This can speed up the download of large files.  To do this, create a `ParallelDownloadTask` instead of a regular `DownloadTask` and specify `chunks` (the number of pieces you want to break the file into, i.e. the number of downloads that will happen in parallel) and `urls` (as a list of URLs, or just one). For example, if you specify 4 chunks and 2 URLs, then the download will be broken into 4 pieces, two each for each URL.
+Add `ParallelDownloadTask`. Some servers may offer an option to download part of the same file from multiple URLs or have multiple parallel downloads of part of a large file using a single URL. This can speed up the download of large files.  To do this, create a `ParallelDownloadTask` instead of a regular `DownloadTask` and specify `chunks` (the number of pieces you want to break the file into, i.e. the number of downloads that will happen in parallel) and `urls` (as a list of URLs, or just one). For example, if you specify 4 chunks and 2 URLs, then the download will be broken into 8 pieces, four each for each URL.
 
 Note that the implementation of this feature creates a regular `DownloadTask` for each chunk, with the group name 'chunk' which is now a reserved group. You will not get updates for this group, but you will get normal updates (status and/or progress) for the `ParallelDownloadTask`.
 
@@ -40,7 +122,7 @@ Tasks can only resume if the ETag header provided by the server is strong, and e
 
 ### Configuration
 
-Add configuration of the downloader for several aspect:
+Add configuration of the downloader for several aspects:
 * Running tasks in 'foreground mode' on Android to allow longer runs and prevent the OS killing some tasks when the app is in the background
 * Setting the request timeout value and, for iOS only, the 'resourceTimeout'
 * Checking available space before attempting a download

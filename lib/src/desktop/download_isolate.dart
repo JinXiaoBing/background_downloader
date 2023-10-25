@@ -1,22 +1,21 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate';
 import 'dart:math';
 
-import 'package:background_downloader/src/base_downloader.dart';
 import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
 import '../exceptions.dart';
 import '../models.dart';
+import '../utils.dart';
 import 'desktop_downloader.dart';
 import 'isolate.dart';
 
-var chunkStartByte =
-    0; // for chunks, the start of the range to download, otherwise 0
+var taskRangeStartByte = 0; // Start of the Task's download range
 String? eTagHeader;
+late DownloadTask downloadTask; // global because filename may change
 
 /// Execute the download task
 ///
@@ -29,6 +28,9 @@ Future<void> doDownloadTask(
     bool isResume,
     Duration requestTimeout,
     SendPort sendPort) async {
+  // use downloadTask from here on as a 'global' variable in this isolate,
+  // as we may change the filename of the task
+  downloadTask = task;
   // tempFilePath is taken from [resumeDataString] if this is a resuming task.
   // Otherwise, it is a generated full path to the temp directory
   final tempFilePath = isResume && resumeData != null
@@ -41,22 +43,19 @@ Future<void> doDownloadTask(
   isResume = isResume &&
       await determineIfResumeIsPossible(tempFilePath, requiredStartByte);
   final client = DesktopDownloader.httpClient;
-  var request = http.Request(task.httpRequestMethod, Uri.parse(task.url));
-  request.headers.addAll(task.headers);
+  var request =
+      http.Request(downloadTask.httpRequestMethod, Uri.parse(downloadTask.url));
+  request.headers.addAll(downloadTask.headers);
   if (isResume) {
-    if (task.group != BaseDownloader.chunkGroup) {
-      request.headers['Range'] = 'bytes=$requiredStartByte-';
-    } else {
-      // for chunks, set range relative to start of chunk range, encoded in metaData
-      final chunkData = jsonDecode(task.metaData);
-      chunkStartByte = chunkData['from'] as int;
-      final chunkEndByte = chunkData['to'] as int;
-      request.headers['Range'] =
-          'bytes=${chunkStartByte + requiredStartByte}-$chunkEndByte';
-    }
+    final taskRangeHeader = downloadTask.headers['Range'] ?? '';
+    final taskRange = parseRange(taskRangeHeader);
+    taskRangeStartByte = taskRange.$1;
+    final resumeRange = (taskRangeStartByte + requiredStartByte, taskRange.$2);
+    final newRangeString = 'bytes=${resumeRange.$1}-${resumeRange.$2 ?? ""}';
+    request.headers['Range'] = newRangeString;
   }
-  if (task.post is String) {
-    request.body = task.post!;
+  if (downloadTask.post is String) {
+    request.body = downloadTask.post!;
   }
   var resultStatus = TaskStatus.failed;
   try {
@@ -67,7 +66,7 @@ Future<void> doDownloadTask(
       final serverAcceptsRanges =
           acceptRangesHeader == 'bytes' || response.statusCode == 206;
       var taskCanResume = false;
-      if (task.allowPause) {
+      if (downloadTask.allowPause) {
         // determine if this task can be paused
         taskCanResume = serverAcceptsRanges;
         sendPort.send(('taskCanResume', taskCanResume));
@@ -77,9 +76,16 @@ Future<void> doDownloadTask(
       if (isResume && (eTagHeader != eTag || eTag?.startsWith('W/') == true)) {
         throw TaskException('Cannot resume: ETag is not identical, or is weak');
       }
+      if (!downloadTask.hasFilename) {
+        downloadTask = await taskWithSuggestedFilename(
+            downloadTask, response.headers, true);
+        // update the filePath by replacing the last segment with the new filename
+        filePath = p.join(p.dirname(filePath), downloadTask.filename);
+        log.finest(
+            'Suggested filename for taskId ${task.taskId}: ${task.filename}');
+      }
       if (okResponses.contains(response.statusCode)) {
         resultStatus = await processOkDownloadResponse(
-            task,
             filePath,
             tempFilePath,
             serverAcceptsRanges,
@@ -103,14 +109,14 @@ Future<void> doDownloadTask(
       }
     }
   } catch (e) {
-    logError(task, e.toString());
+    logError(downloadTask, e.toString());
     setTaskError(e);
   }
   if (isCanceled) {
     // cancellation overrides other results
     resultStatus = TaskStatus.canceled;
   }
-  processStatusUpdateInIsolate(task, resultStatus, sendPort);
+  processStatusUpdateInIsolate(downloadTask, resultStatus, sendPort);
 }
 
 /// Return true if resume is possible
@@ -139,7 +145,6 @@ Future<bool> determineIfResumeIsPossible(
 /// - .failed -> delete temp file
 /// - .paused -> post resume information
 Future<TaskStatus> processOkDownloadResponse(
-    Task task,
     String filePath,
     String tempFilePath,
     bool serverAcceptsRanges,
@@ -148,7 +153,10 @@ Future<TaskStatus> processOkDownloadResponse(
     Duration requestTimeout,
     http.StreamedResponse response,
     SendPort sendPort) async {
-  final contentLength = response.contentLength ?? -1;
+  // contentLength is extracted from response header, and if not available
+  // we attempt to extract from [Task.headers], allowing developer to
+  // set the content length if already known
+  final contentLength = getContentLength(response.headers, downloadTask);
   isResume = isResume && response.statusCode == 206;
   if (isResume && !await prepareResume(response, tempFilePath)) {
     deleteTempFile(tempFilePath);
@@ -161,7 +169,7 @@ Future<TaskStatus> processOkDownloadResponse(
     outStream = File(tempFilePath)
         .openWrite(mode: isResume ? FileMode.append : FileMode.write);
     final transferBytesResult = await transferBytes(response.stream, outStream,
-        contentLength, task, sendPort, requestTimeout);
+        contentLength, downloadTask, sendPort, requestTimeout);
     switch (transferBytesResult) {
       case TaskStatus.complete:
         // copy file to destination, creating dirs if needed
@@ -193,7 +201,7 @@ Future<TaskStatus> processOkDownloadResponse(
         throw ArgumentError('Cannot process $transferBytesResult');
     }
   } catch (e) {
-    logError(task, e.toString());
+    logError(downloadTask, e.toString());
     setTaskError(e);
   } finally {
     try {
@@ -208,7 +216,7 @@ Future<TaskStatus> processOkDownloadResponse(
         File(tempFilePath).deleteSync();
       }
     } catch (e) {
-      logError(task, 'Could not delete temp file $tempFilePath');
+      logError(downloadTask, 'Could not delete temp file $tempFilePath');
     }
   }
   return resultStatus;
@@ -242,7 +250,7 @@ Future<bool> prepareResume(
   final tempFileLength = await tempFile.length();
   log.finest(
       'Resume start=$start, end=$end of total=$total bytes, tempFile = $tempFileLength bytes');
-  startByte = start - chunkStartByte; // relative to start of range
+  startByte = start - taskRangeStartByte; // relative to start of range
   if (startByte > tempFileLength) {
     log.fine('Offered range not feasible: $range with startByte $startByte');
     taskException = TaskResumeException(

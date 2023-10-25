@@ -144,7 +144,7 @@ Future<void> listenToIncomingMessages(
 /// Note: does not flush or close any streams
 Future<TaskStatus> transferBytes(
     Stream<List<int>> inStream,
-    EventSink<List<int>> outStream,
+    StreamSink<List<int>> outStream,
     int contentLength,
     Task task,
     SendPort sendPort,
@@ -152,48 +152,43 @@ Future<TaskStatus> transferBytes(
   if (contentLength == 0) {
     contentLength = -1;
   }
-  final streamResultStatus = Completer<TaskStatus>();
-  late StreamSubscription<List<int>> subscription;
-  var timeout = Timer(requestTimeout, () {
-    taskException = TaskConnectionException('Connection timed out');
-    streamResultStatus.complete(TaskStatus.failed);
-  });
-  subscription = inStream.listen(
-      (bytes) {
-        timeout.cancel();
-        timeout = Timer(requestTimeout, () {
-          taskException = TaskConnectionException('Connection timed out');
-          streamResultStatus.complete(TaskStatus.failed);
-        });
-        if (isCanceled) {
-          streamResultStatus.complete(TaskStatus.canceled);
-          return;
-        }
-        if (isPaused) {
-          streamResultStatus.complete(TaskStatus.paused);
-          return;
-        }
-        outStream.add(bytes);
-        bytesTotal += bytes.length;
-        final progress = min(
-            (bytesTotal + startByte).toDouble() / (contentLength + startByte),
-            0.999);
-        final now = DateTime.now();
-        if (contentLength > 0 && shouldSendProgressUpdate(progress, now)) {
-          processProgressUpdateInIsolate(
-              task, progress, sendPort, contentLength + startByte);
-          lastProgressUpdate = progress;
-          nextProgressUpdateTime = now.add(const Duration(milliseconds: 500));
-        }
-      },
-      onDone: () => streamResultStatus.complete(TaskStatus.complete),
-      onError: (e) {
-        logError(task, e);
-        setTaskError(e);
-        streamResultStatus.complete(TaskStatus.failed);
-      });
-  final resultStatus = await streamResultStatus.future;
-  await subscription.cancel();
+  var resultStatus = TaskStatus.complete;
+  try {
+    await outStream
+        .addStream(inStream.timeout(requestTimeout, onTimeout: (sink) {
+      taskException = TaskConnectionException('Connection timed out');
+      resultStatus = TaskStatus.failed;
+      sink.close(); // ends the stream
+    }).map((bytes) {
+      if (isCanceled) {
+        resultStatus = TaskStatus.canceled;
+        throw StateError('Canceled');
+      }
+      if (isPaused) {
+        resultStatus = TaskStatus.paused;
+        throw StateError('Paused');
+      }
+      bytesTotal += bytes.length;
+      final progress = min(
+          (bytesTotal + startByte).toDouble() / (contentLength + startByte),
+          0.999);
+      final now = DateTime.now();
+      if (contentLength > 0 && shouldSendProgressUpdate(progress, now)) {
+        processProgressUpdateInIsolate(
+            task, progress, sendPort, contentLength + startByte);
+        lastProgressUpdate = progress;
+        nextProgressUpdateTime = now.add(const Duration(milliseconds: 500));
+      }
+      return bytes;
+    }));
+  } catch (e) {
+    if (resultStatus == TaskStatus.complete) {
+      // this was an unintentional error thrown within the stream processing
+      logError(task, e.toString());
+      setTaskError(e);
+      resultStatus = TaskStatus.failed;
+    }
+  }
   return resultStatus;
 }
 
@@ -231,6 +226,7 @@ void processStatusUpdateInIsolate(
   if (task.providesStatusUpdates || retryNeeded) {
     sendPort.send((
       'statusUpdate',
+      task,
       status,
       status == TaskStatus.failed
           ? taskException ?? TaskException('None')
@@ -272,6 +268,7 @@ void processProgressUpdateInIsolate(
           : Duration(microseconds: (remainingBytes / networkSpeed).round());
       sendPort.send((
         'progressUpdate',
+        task,
         progress,
         expectedFileSize,
         networkSpeed,
@@ -281,6 +278,7 @@ void processProgressUpdateInIsolate(
       // no download speed or time remaining
       sendPort.send((
         'progressUpdate',
+        task,
         progress,
         expectedFileSize,
         -1.0,
